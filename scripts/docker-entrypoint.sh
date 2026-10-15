@@ -31,6 +31,15 @@ write_commit_info() {
       '{sha:$sha,shortSha:$shortSha,message:$message,author:$author,date:$date,recentCommits:$recentCommits}' \
       > "$repo_dir/.commit-info.json" 2>/dev/null || true
     echo "Commit info: $(jq -r '.shortSha + " - " + .message' "$repo_dir/.commit-info.json" 2>/dev/null || echo 'unavailable')"
+    # Exclude .commit-info.json from git status so build steps asserting a clean
+    # working tree are not broken by a platform-generated file. Use
+    # rev-parse --git-path so this works with worktrees where .git is a file.
+    if git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1; then
+      local excl
+      excl="$(git -C "$repo_dir" rev-parse --git-path info/exclude 2>/dev/null)"
+      mkdir -p "$(dirname "$excl")"
+      grep -qxF '.commit-info.json' "$excl" 2>/dev/null || echo '.commit-info.json' >> "$excl"
+    fi
   fi
 }
 
@@ -82,23 +91,68 @@ if [[ ! -z "$GIT_URL" ]]; then
     GIT_PATH="${GIT_PATH%%#*}"  # remove fragment from path
   fi
 
+  # Credentials travel via an HTTP Authorization header (git -c
+  # http.<url>.extraheader=...) instead of being embedded in the clone/fetch
+  # URL — the same technique actions/checkout uses. A -c value passed to a
+  # single git invocation is never persisted to .git/config, and since it
+  # isn't part of the URL string it cannot appear in "fatal: ... for '<url>'"
+  # -style output either. That URL-in-stderr behavior is exactly how the PAT
+  # was leaking into pod logs (promtail -> Loki): git itself echoes the URL
+  # argument back on a failed clone/fetch, regardless of what this script
+  # logs — embedding the token in the URL argument was the vulnerability,
+  # not anything this script explicitly printed.
+  #
+  # The header config is scoped to the exact host being cloned/fetched from
+  # (http.https://<host>/.extraheader), NOT a bare http.extraheader. An
+  # unscoped extraheader is attached to every request git makes for the
+  # invocation, including a redirect to a different host; scoping it means
+  # git only attaches the header when the request host matches
+  # GIT_HOST_PUBLIC. Empirically verified: a config key of
+  # "http.https://<host>/.extraheader" is sent on requests to that exact
+  # host (scheme+host must match) and is NOT sent on requests to a
+  # different host, whereas a bare "http.extraheader" is sent to every
+  # host — see PR #56 discussion.
+  GIT_AUTH_ARGS=()
+  if [[ ! -z "$TOKEN" ]]; then
+    AUTH_B64=$(printf '%s' "x-access-token:${TOKEN}" | base64 | tr -d '\n')
+    GIT_AUTH_ARGS=(-c "http.https://${GIT_HOST_PUBLIC}/.extraheader=AUTHORIZATION: basic ${AUTH_B64}")
+  elif [[ "$GIT_HOST" != "$GIT_HOST_PUBLIC" ]]; then
+    # Gitea: SOURCE_URL pre-embeds user:pass@host — reuse it as the
+    # Basic-Auth pair instead of putting it back into the URL.
+    # Use %@* (single %, shortest suffix match) to split on the LAST "@",
+    # matching the ##*@ (longest prefix match) convention already used for
+    # GIT_HOST_PUBLIC above. A password containing a literal "@" (e.g.
+    # "oscadmin:pa@ss@host") must keep the full password — %%@* (longest
+    # suffix match) would incorrectly split on the FIRST "@" and silently
+    # truncate the password.
+    CREDS="${GIT_HOST%@*}"
+    AUTH_B64=$(printf '%s' "$CREDS" | base64 | tr -d '\n')
+    GIT_AUTH_ARGS=(-c "http.https://${GIT_HOST_PUBLIC}/.extraheader=AUTHORIZATION: basic ${AUTH_B64}")
+  fi
+
+  # Defense in depth: redact any credential-shaped token from a git
+  # command's own stderr, in case some other/future git diagnostic leaks
+  # something sensitive we haven't anticipated. 2> >(...) is process
+  # substitution, not a pipe, so it does not affect the wrapped command's
+  # exit code ($?), which the exit-code checks below rely on.
+  git_scrub_stderr() {
+    "$@" 2> >(sed -r 's/gh[pso]_[A-Za-z0-9]{20,}/[REDACTED]/g; s/([Bb]asic )[A-Za-z0-9+\/=]{8,}/\1[REDACTED]/g' >&2)
+  }
+
   git config --global --add safe.directory /usercontent
 
   if [ -d "/usercontent/.git" ]; then
     echo "existing repo found, fetching updates"
-    # Re-inject credentials before fetch — token was scrubbed from origin after initial clone.
-    # Without this, private-repo fetches fail silently and reset resolves stale cached refs.
-    if [[ ! -z "$TOKEN" ]]; then
-      git -C /usercontent/ remote set-url origin "https://${TOKEN}@${GIT_HOST_PUBLIC}${GIT_PATH}"
-    elif [[ "$GIT_HOST" != "$GIT_HOST_PUBLIC" ]]; then
-      git -C /usercontent/ remote set-url origin "https://${GIT_HOST}${GIT_PATH}"
-    fi
-    git -C /usercontent/ fetch origin
-    # Strip credentials again so PAT does not persist in .git/config
+    # Auth travels via GIT_AUTH_ARGS (an HTTP header) rather than an
+    # embedded-credential remote URL, so there is nothing to inject into
+    # origin before fetching and nothing to scrub out afterward. Normalize
+    # origin to the credential-free URL regardless, in case this PVC's
+    # .git/config predates this fix and still has a credentialed origin.
     git -C /usercontent/ remote set-url origin "https://${GIT_HOST_PUBLIC}${GIT_PATH}"
+    git_scrub_stderr git -C /usercontent/ "${GIT_AUTH_ARGS[@]}" fetch origin
     if [ -n "${GIT_COMMIT_SHA:-}" ]; then
       echo "checking out exact commit: $GIT_COMMIT_SHA"
-      git -C /usercontent/ fetch origin "$GIT_COMMIT_SHA" 2>/dev/null || true
+      git_scrub_stderr git -C /usercontent/ "${GIT_AUTH_ARGS[@]}" fetch origin "$GIT_COMMIT_SHA" 2>/dev/null || true
       git -C /usercontent/ checkout --detach "$GIT_COMMIT_SHA"
     elif [[ ! -z "$branch" ]]; then
       echo "resetting to origin/$branch"
@@ -117,26 +171,16 @@ if [[ ! -z "$GIT_URL" ]]; then
     git -C /usercontent/ clean -fd --exclude=node_modules --exclude=.next
     write_commit_info /usercontent
   else
-    # Fresh clone — inject token into the URL if provided
+    # Fresh clone — the URL is always credential-free; auth (if any) travels
+    # via GIT_AUTH_ARGS, so origin is never set with embedded credentials in
+    # the first place and there is nothing to scrub after cloning.
     echo "ensure staging dir is empty"
     rm -rf /usercontent/* /usercontent/.[!.]*
-    if [[ ! -z "$TOKEN" ]]; then
-      echo "cloning https://***@${GIT_HOST_PUBLIC}${GIT_PATH}"
-      git clone "https://${TOKEN}@${GIT_HOST_PUBLIC}${GIT_PATH}" /usercontent/
-    elif [[ "$GIT_HOST" != "$GIT_HOST_PUBLIC" ]]; then
-      # SOURCE_URL embeds credentials (e.g. Gitea: https://user:pass@host/...).
-      # Clone with them in place but keep them out of the log line.
-      echo "cloning https://***@${GIT_HOST_PUBLIC}${GIT_PATH}"
-      git clone "https://${GIT_HOST}${GIT_PATH}" /usercontent/
-    else
-      echo "cloning https://${GIT_HOST_PUBLIC}${GIT_PATH}"
-      git clone "https://${GIT_HOST_PUBLIC}${GIT_PATH}" /usercontent/
-    fi
-    # Scrub PAT from origin remote — token must not persist to .git/config
-    git -C /usercontent/ remote set-url origin "https://${GIT_HOST_PUBLIC}${GIT_PATH}"
+    echo "cloning https://${GIT_HOST_PUBLIC}${GIT_PATH}"
+    git_scrub_stderr git "${GIT_AUTH_ARGS[@]}" clone "https://${GIT_HOST_PUBLIC}${GIT_PATH}" /usercontent/
     if [ -n "${GIT_COMMIT_SHA:-}" ]; then
       echo "checking out exact commit: $GIT_COMMIT_SHA"
-      git -C /usercontent/ fetch origin "$GIT_COMMIT_SHA" 2>/dev/null || true
+      git_scrub_stderr git -C /usercontent/ "${GIT_AUTH_ARGS[@]}" fetch origin "$GIT_COMMIT_SHA" 2>/dev/null || true
       git -C /usercontent/ checkout --detach "$GIT_COMMIT_SHA"
     elif [[ ! -z "$branch" ]]; then
       echo "checking out branch: $branch"
@@ -162,48 +206,140 @@ fi
 
 chown node:node -R /usercontent/
 
-# Exchange runner refresh token for a fresh PAT (if applicable)
+# Exchange runner refresh token for a fresh PAT (if applicable).
+# Uses -s (not -f) so the response body is always captured, even on 4xx errors.
+# This lets us distinguish a revoked/expired runner token (hard fail) from an
+# app that still uses a classic long-lived PAT (backward-compat fallback).
+# Transient failures (5xx, network errors) are retried up to 3 times with a
+# 3-second backoff before falling back to the stored token.
 if [[ ! -z "$OSC_ACCESS_TOKEN" ]] && [[ ! -z "$CONFIG_SVC" ]]; then
-  REFRESH_RESULT=$(curl -sf -X POST \
-    "https://token.svc.${OSC_ENV:-prod}.osaas.io/runner-token/refresh" \
-    -H "Content-Type: application/json" \
-    -d "{\"token\":\"$OSC_ACCESS_TOKEN\"}" 2>/dev/null)
-  if [ $? -eq 0 ] && [ ! -z "$REFRESH_RESULT" ]; then
-    FRESH_PAT=$(echo "$REFRESH_RESULT" | jq -r '.token // empty')
+  REFRESH_HTTP=""
+  REFRESH_JSON=""
+  TOKEN_SVC_URL="https://token.svc.${OSC_ENV:-prod}.osaas.io"
+
+  for REFRESH_ATTEMPT in 1 2 3; do
+    REFRESH_BODY=$(curl -s -w "\n%{http_code}" -X POST \
+      "${TOKEN_SVC_URL}/runner-token/refresh" \
+      -H "Content-Type: application/json" \
+      -d "{\"token\":\"$OSC_ACCESS_TOKEN\"}" 2>/dev/null)
+    REFRESH_HTTP=$(echo "$REFRESH_BODY" | tail -1)
+    REFRESH_JSON=$(echo "$REFRESH_BODY" | head -n -1)
+
+    # On a definitive response (200 or 401), stop retrying immediately —
+    # only transient/network failures (empty HTTP code or 5xx) are worth retrying.
+    if [ "$REFRESH_HTTP" = "200" ] || [ "$REFRESH_HTTP" = "401" ]; then
+      break
+    fi
+
+    if [ "$REFRESH_ATTEMPT" -lt 3 ]; then
+      echo "[CONFIG] WARNING: token refresh attempt $REFRESH_ATTEMPT failed (HTTP '$REFRESH_HTTP'), retrying in 3s..."
+      sleep 3
+    fi
+  done
+
+  if [ "$REFRESH_HTTP" = "200" ] && [ ! -z "$REFRESH_JSON" ]; then
+    FRESH_PAT=$(echo "$REFRESH_JSON" | jq -r '.token // empty')
     if [ ! -z "$FRESH_PAT" ]; then
       export OSC_ACCESS_TOKEN="$FRESH_PAT"
       echo "[CONFIG] Refreshed access token via runner refresh token"
     fi
+  elif [ "$REFRESH_HTTP" = "401" ]; then
+    REFRESH_CODE=$(echo "$REFRESH_JSON" | jq -r '.code // empty' 2>/dev/null)
+    case "$REFRESH_CODE" in
+      refresh_token_expired|refresh_token_revoked)
+        # The runner refresh token itself has expired or been revoked.
+        # Falling back silently would produce a misleading "Authorization token
+        # expired" from app-config-svc. Exit with a clear message instead so the
+        # pod enters CrashLoopBackOff with actionable output in the logs.
+        echo "[CONFIG] ERROR: Runner refresh token is $REFRESH_CODE."
+        echo "[CONFIG] The app's runner credentials have expired (365-day token lifetime)."
+        echo "[CONFIG] Action required: Rebuild the app from the OSC dashboard"
+        echo "[CONFIG]   (My Apps → select app → Rebuild) to issue a fresh runner token."
+        exit 1
+        ;;
+      refresh_token_invalid)
+        # OSC_ACCESS_TOKEN is a classic long-lived PAT, not a runner refresh token.
+        # Use it as-is — this is the intended backward-compat path for older apps.
+        ;;
+      *)
+        # Unexpected 401 — fall back to original token (transient or unknown auth error)
+        echo "[CONFIG] WARNING: Runner token refresh returned HTTP 401 (code='$REFRESH_CODE') — using original token"
+        ;;
+    esac
+  else
+    # Non-200, non-401 after all retries (5xx, network error, etc.) — fall back to
+    # original token so transient infrastructure issues don't hard-block app startup.
+    echo "[CONFIG] WARNING: token refresh failed after 3 attempts (last HTTP '$REFRESH_HTTP') — using original token"
   fi
-  # If refresh failed, OSC_ACCESS_TOKEN retains its original value (backward compat)
 fi
 
 LOADED_CONFIG_EXPORTS=""
 if [[ ! -z "$OSC_ACCESS_TOKEN" ]] && [[ ! -z "$CONFIG_SVC" ]]; then
   echo "[CONFIG] Loading environment variables from config service '$CONFIG_SVC'"
-  config_env_output=$(npx -y @osaas/cli@latest web config-to-env ${OSC_ENV:+--env "$OSC_ENV"} "$CONFIG_SVC" 2>&1)
-  config_exit=$?
-  if [ $config_exit -eq 0 ]; then
-    # Only eval lines that are valid shell export statements to prevent
-    # executing error messages or malformed output as shell commands
-    valid_exports=$(echo "$config_env_output" | grep "^export [A-Za-z_][A-Za-z0-9_]*=")
-    if [ -n "$valid_exports" ]; then
-      eval "$valid_exports"
-      var_count=$(echo "$valid_exports" | wc -l | tr -d ' ')
-      echo "[CONFIG] Loaded $var_count environment variable(s) — available for build and runtime"
-      # Save for later: write to .env.osc when SUB_PATH is set (see below)
-      LOADED_CONFIG_EXPORTS="$valid_exports"
+  config_err_file=$(mktemp)
+  config_failed=0
+  config_fail_reason=""
+  config_attempt=1
+  config_max_attempts=3
+  while true; do
+    config_failed=0
+    config_env_output=$(timeout 60s npx -y @osaas/cli@latest web config-to-env ${OSC_ENV:+--env "$OSC_ENV"} "$CONFIG_SVC" 2>"$config_err_file")
+    config_exit=$?
+    config_err_output=$(cat "$config_err_file")
+    valid_exports=""
+    if [ $config_exit -eq 124 ]; then
+      config_failed=1
+      config_fail_reason="config-to-env timed out after 60s"
+    elif [ $config_exit -ne 0 ]; then
+      config_failed=1
+      config_fail_reason="exit code $config_exit"
     else
-      echo "[CONFIG] WARNING: Config service returned success but no valid export statements."
-      echo "[CONFIG] Raw output: $config_env_output"
+      # Only eval lines that are valid shell export statements to prevent
+      # executing error messages or malformed output as shell commands
+      valid_exports=$(echo "$config_env_output" | grep "^export [A-Za-z_][A-Za-z0-9_]*=")
+      if [ -z "$valid_exports" ] && [ -n "$config_env_output" ]; then
+        config_failed=1
+        config_fail_reason="config service returned output with no valid export statements"
+      fi
     fi
-  else
-    echo "[CONFIG] ERROR: Failed to load config from '$CONFIG_SVC' (exit code $config_exit)."
-    echo "[CONFIG] Raw output: $config_env_output"
-    if echo "$config_env_output" | grep -qi "expired\|unauthorized\|401"; then
+    if [ $config_failed -eq 0 ]; then
+      break
+    fi
+    # Auth and not-found failures are permanent: do not retry
+    if echo "$config_env_output $config_err_output" | grep -qi "expired\|unauthorized\|401\|not found\|404"; then
+      break
+    fi
+    if [ $config_attempt -ge $config_max_attempts ]; then
+      break
+    fi
+    echo "[CONFIG] WARNING: Failed to load config (attempt $config_attempt/$config_max_attempts: $config_fail_reason) — retrying in 3s"
+    config_attempt=$((config_attempt + 1))
+    sleep 3
+  done
+  rm -f "$config_err_file"
+
+  if [ $config_failed -eq 1 ]; then
+    echo "[CONFIG] ERROR: Failed to load config from '$CONFIG_SVC' ($config_fail_reason, exit code $config_exit)."
+    echo "[CONFIG] Raw output: $config_env_output $config_err_output"
+    if echo "$config_env_output $config_err_output" | grep -qi "expired\|unauthorized\|401"; then
       echo "[CONFIG] Action required: Your OSC_ACCESS_TOKEN may have expired."
       echo "[CONFIG] Use the 'refresh-app-config' MCP tool to issue a fresh token."
     fi
+    echo "[CONFIG] Not starting the application without its configuration."
+    kill $LOADING_PID 2>/dev/null
+    wait $LOADING_PID 2>/dev/null
+    trap - EXIT
+    exec node /runner/loading-server.js error-page.html failed
+  fi
+
+  if [ -n "$valid_exports" ]; then
+    eval "$valid_exports"
+    var_count=$(echo "$valid_exports" | wc -l | tr -d ' ')
+    echo "[CONFIG] Loaded $var_count environment variable(s) — available for build and runtime"
+    # Save for later: write to .env.osc when SUB_PATH is set (see below)
+    LOADED_CONFIG_EXPORTS="$valid_exports"
+  else
+    echo "[CONFIG] Config service '$CONFIG_SVC' has no parameters"
   fi
 fi
 

@@ -1,4 +1,4 @@
-ARG NODE_IMAGE=node:24-alpine
+ARG NODE_IMAGE=node:24.22.1-alpine
 
 # Alpine (musl) userlands for older Node LTS majors, bundled alongside the
 # default image so docker-entrypoint.sh can honor an app's package.json
@@ -15,7 +15,7 @@ ARG NODE_IMAGE=node:24-alpine
 # ~95-100MB per extra major, uncompressed).
 FROM node:18-alpine AS node18
 FROM node:20-alpine AS node20
-FROM node:22-alpine AS node22
+FROM node:22.23.4-alpine AS node22
 
 FROM ${NODE_IMAGE}
 # python3/make/g++ are the standard node-gyp toolchain for Alpine (musl).
@@ -29,7 +29,11 @@ FROM ${NODE_IMAGE}
 # build, which needs this toolchain present at that point. A multi-stage
 # split (toolchain in a builder, slim final image) does not apply here
 # because there is no single build-time npm install to isolate.
-RUN apk add --no-cache bash git runuser aws-cli curl jq python3 make g++
+# tini is the container's init (PID 1): it forwards signals to
+# docker-entrypoint.sh and reaps zombies. setpriv drops privileges to the
+# "node" user and then execs the app (runuser/su would stay in between as a
+# watching parent that forwards SIGTERM and SIGKILLs the app two seconds later).
+RUN apk add --no-cache bash git tini setpriv aws-cli curl jq python3 make g++
 
 # Corepack ships with Node 24 and manages yarn/pnpm per the app's
 # package.json "packageManager" field. Enabling it once at build time
@@ -56,5 +60,7 @@ COPY ./scripts ./
 VOLUME /data
 VOLUME /usercontent
 ENV PORT=8080
-ENTRYPOINT [ "/runner/docker-entrypoint.sh" ]
+# Plain tini, without -g: -g would also deliver SIGTERM to the app's process
+# group, and docker-entrypoint.sh already delivers it once to the app.
+ENTRYPOINT [ "/sbin/tini", "--", "/runner/docker-entrypoint.sh" ]
 CMD [ "npm", "start" ]
